@@ -28,7 +28,7 @@ __all__ = [
 
 
 TEXT_COMPLETIONS_PATH = "/v1/completions"
-CHAT_COMPLETIONS_PATH = "/v1/chat/completions"
+CHAT_COMPLETIONS_PATH = "/v1/completions"
 
 EndpointType = Literal["chat_completions", "models", "text_completions"]
 CHAT_COMPLETIONS: EndpointType = "chat_completions"
@@ -288,53 +288,38 @@ class OpenAIHTTPBackend(Backend):
         **kwargs,
     ) -> AsyncGenerator[Union[StreamingTextResponse, ResponseSummary], None]:
         """
-        Generate chat completions for the given content using the OpenAI
-        chat completions endpoint: /v1/chat/completions.
-
-        :param content: The content (or list of content) to generate a completion for.
-            This supports any combination of text, images, and audio (model dependent).
-            Supported text only request examples:
-                content="Sample prompt", content=["Sample prompt", "Second prompt"],
-                content=[{"type": "text", "value": "Sample prompt"}.
-            Supported text and image request examples:
-                content=["Describe the image", PIL.Image.open("image.jpg")],
-                content=["Describe the image", Path("image.jpg")],
-                content=["Describe the image", {"type": "image_url",
-                    "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}].
-            Supported text and audio request examples:
-                content=["Transcribe the audio", Path("audio.wav")],
-                content=["Transcribe the audio", {"type": "input_audio",
-                "input_audio": {"data": f"{base64_bytes}", "format": "wav}].
-            Additionally, if raw_content=True then the content is passed directly to the
-            backend without any processing.
-        :param request_id: The unique identifier for the request, if any.
-            Added to logging statements and the response for tracking purposes.
-        :param prompt_token_count: The number of tokens measured in the prompt, if any.
-            Returned in the response stats for later analysis, if applicable.
-        :param output_token_count: If supplied, the number of tokens to enforce
-            generation of for the output for this request.
-        :param kwargs: Additional keyword arguments to pass with the request.
-        :return: An async generator that yields a StreamingTextResponse for start,
-            a StreamingTextResponse for each received iteration,
-            and a ResponseSummary for the final response.
+        Generate chat completions for the given content using the completions endpoint.
+        Since the chat endpoint is not available, we'll use the text completions endpoint
+        and format the chat messages as a single prompt.
         """
         logger.debug("{} invocation with args: {}", self.__class__.__name__, locals())
         headers = self._headers()
-        params = self._params(CHAT_COMPLETIONS)
-        body = self._body(CHAT_COMPLETIONS)
+        params = self._params(TEXT_COMPLETIONS)
+        body = self._body(TEXT_COMPLETIONS)
         messages = (
             content if raw_content else self._create_chat_messages(content=content)
         )
+        
+        # Convert chat messages to a single prompt string
+        prompt = ""
+        for msg in messages:
+            if msg["role"] == "user":
+                prompt += f"User: {msg['content']}\n"
+            elif msg["role"] == "assistant":
+                prompt += f"Assistant: {msg['content']}\n"
+            elif msg["role"] == "system":
+                prompt += f"System: {msg['content']}\n"
+        
         payload = self._completions_payload(
             body=body,
             orig_kwargs=kwargs,
             max_output_tokens=output_token_count,
-            messages=messages,
+            prompt=prompt,
         )
 
         try:
             async for resp in self._iterative_completions_request(
-                type_="chat_completions",
+                type_="text_completions",
                 request_id=request_id,
                 request_prompt_tokens=prompt_token_count,
                 request_output_tokens=output_token_count,
@@ -422,29 +407,38 @@ class OpenAIHTTPBackend(Backend):
         max_output_tokens: Optional[int],
         **kwargs,
     ) -> dict:
+        """
+        Create the payload for the completions request.
+        Format the request to work with standard completions endpoint.
+        """
         payload = body or {}
         payload.update(orig_kwargs or {})
         payload.update(kwargs)
-        payload["model"] = self.model
-        payload["stream"] = True
-        payload["stream_options"] = {
-            "include_usage": True,
-        }
 
+        # Remove OpenAI-specific fields that aren't needed for standard completions
+        payload.pop("model", None)
+        payload.pop("stream", None)
+        payload.pop("stream_options", None)
+
+        # Add standard completions fields
         if max_output_tokens or self.max_output_tokens:
-            logger.debug(
-                "{} adding payload args for setting output_token_count: {}",
-                self.__class__.__name__,
-                max_output_tokens or self.max_output_tokens,
-            )
             payload["max_tokens"] = max_output_tokens or self.max_output_tokens
-            payload["max_completion_tokens"] = payload["max_tokens"]
 
-            if max_output_tokens:
-                # only set stop and ignore_eos if max_output_tokens set at request level
-                # otherwise the instance value is just the max to enforce we stay below
-                payload["stop"] = None
-                payload["ignore_eos"] = True
+        # Format the request for inference-gateway
+        if "prompt" in payload:
+            payload["text"] = payload.pop("prompt")
+        elif "messages" in payload:
+            # Convert chat messages to a single text prompt
+            messages = payload.pop("messages")
+            text = ""
+            for msg in messages:
+                if msg["role"] == "user":
+                    text += f"User: {msg['content']}\n"
+                elif msg["role"] == "assistant":
+                    text += f"Assistant: {msg['content']}\n"
+                elif msg["role"] == "system":
+                    text += f"System: {msg['content']}\n"
+            payload["text"] = text
 
         return payload
 
@@ -456,57 +450,39 @@ class OpenAIHTTPBackend(Backend):
             Any,
         ],
     ) -> list[dict]:
+        """
+        Create the chat messages for the request.
+        Format messages to work with standard completions endpoint.
+        """
         if isinstance(content, str):
-            return [
-                {
-                    "role": "user",
-                    "content": content,
-                }
-            ]
+            return [{"role": "user", "content": content}]
 
         if isinstance(content, list):
-            resolved_content = []
-
+            resolved_content = ""
             for item in content:
-                if isinstance(item, dict):
-                    resolved_content.append(item)
-                elif isinstance(item, str):
-                    resolved_content.append({"type": "text", "text": item})
-                elif isinstance(item, Image.Image) or (
-                    isinstance(item, Path) and item.suffix.lower() in [".jpg", ".jpeg"]
-                ):
-                    image = item if isinstance(item, Image.Image) else Image.open(item)
-                    encoded = base64.b64encode(image.tobytes()).decode("utf-8")
-                    resolved_content.append(
-                        {
-                            "type": "image",
-                            "image": {
-                                "url": f"data:image/jpeg;base64,{encoded}",
-                            },
-                        }
-                    )
-                elif isinstance(item, Path) and item.suffix.lower() in [".wav"]:
-                    encoded = base64.b64encode(item.read_bytes()).decode("utf-8")
-                    resolved_content.append(
-                        {
-                            "type": "input_audio",
-                            "input_audio": {
-                                "data": f"{encoded}",
-                                "format": "wav",
-                            },
-                        }
-                    )
+                if isinstance(item, str):
+                    resolved_content += item
+                elif isinstance(item, dict):
+                    if "text" in item:
+                        resolved_content += item["text"]
+                    elif "content" in item:
+                        resolved_content += item["content"]
+                elif isinstance(item, Path):
+                    resolved_content += item.read_text()
+                elif isinstance(item, Image.Image):
+                    # Convert image to base64
+                    import io
+                    import base64
+                    buffered = io.BytesIO()
+                    item.save(buffered, format="PNG")
+                    img_str = base64.b64encode(buffered.getvalue()).decode()
+                    resolved_content += f"<image>{img_str}</image>"
                 else:
                     raise ValueError(
                         f"Unsupported content item type: {item} in list: {content}"
                     )
 
-            return [
-                {
-                    "role": "user",
-                    "content": resolved_content,
-                }
-            ]
+            return [{"role": "user", "content": resolved_content}]
 
         raise ValueError(f"Unsupported content type: {content}")
 
@@ -605,67 +581,45 @@ class OpenAIHTTPBackend(Backend):
                         request_id=request_id,
                     )
 
-                if usage := self._extract_completions_usage(data):
-                    response_prompt_count = usage["prompt"]
-                    response_output_count = usage["output"]
-
-        logger.info(
-            "{} request: {} with headers: {} and params: {} and payload: {} completed"
-            "with: {}",
-            self.__class__.__name__,
-            request_id,
-            headers,
-            params,
-            payload,
-            response_value,
-        )
+        if last_iter_time is None:
+            last_iter_time = iter_time
 
         yield ResponseSummary(
+            type_="complete",
             value=response_value,
-            request_args=RequestArgs(
-                target=target,
-                headers=headers,
-                params=params,
-                payload=payload,
-                timeout=self.timeout,
-                http2=self.http2,
-                follow_redirects=self.follow_redirects,
-            ),
+            iter_count=iter_count,
             start_time=start_time,
-            end_time=iter_time,
             first_iter_time=first_iter_time,
             last_iter_time=last_iter_time,
-            iterations=iter_count,
-            request_prompt_tokens=request_prompt_tokens,
-            request_output_tokens=request_output_tokens,
-            response_prompt_tokens=response_prompt_count,
-            response_output_tokens=response_output_count,
+            time=time.time(),
             request_id=request_id,
+            request_args=RequestArgs(
+                prompt_token_count=request_prompt_tokens,
+                output_token_count=request_output_tokens,
+            ),
+            response_usage=self._extract_completions_usage({}),
         )
 
     @staticmethod
     def _extract_completions_delta_content(
         type_: Literal["text_completions", "chat_completions"], data: dict
     ) -> Optional[str]:
-        if "choices" not in data or not data["choices"]:
-            return None
-
+        """
+        Extract the delta content from the response data.
+        Handle standard completions response format.
+        """
         if type_ == "text_completions":
-            return data["choices"][0]["text"]
-
-        if type_ == "chat_completions":
-            return data["choices"][0]["delta"]["content"]
-
-        raise ValueError(f"Unsupported type: {type_}")
+            return data.get("text", "")
+        elif type_ == "chat_completions":
+            return data.get("message", {}).get("content", "")
+        return None
 
     @staticmethod
     def _extract_completions_usage(
         data: dict,
     ) -> Optional[dict[Literal["prompt", "output"], int]]:
-        if "usage" not in data or not data["usage"]:
-            return None
-
-        return {
-            "prompt": data["usage"]["prompt_tokens"],
-            "output": data["usage"]["completion_tokens"],
-        }
+        """
+        Extract the usage information from the response data.
+        Return None since standard completions don't provide usage stats.
+        """
+        return None
